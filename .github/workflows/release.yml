@@ -1,0 +1,174 @@
+# Builds Chess World installers from the private source repo and publishes them here, in this public
+# releases-only repo (the source stays private). Runs for every new `v*` tag of ralabarta/chess-world
+# (hourly check) or by hand for a given tag. The result is a DRAFT release: check the installers
+# (smoke test in the source repo's docs/release.md), then publish it; only published releases reach
+# the in-app updater (https://github.com/ralabarta/chess-world-releases/releases/latest/download/latest.json).
+# Secrets (this repo): CODE_DEPLOY_KEY (read-only deploy key of the source repo), TAURI_SIGNING_PRIVATE_KEY,
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD; optional APPLE_* / WINDOWS_CERTIFICATE* (signing is skipped without them).
+name: Release
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to build, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: git@github.com:ralabarta/chess-world.git
+  MAIA_SHA256: f13b860dbe8d36e2c024a428cbcc719e0e586059f0b898a12976817504c2c726
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_KEY: ${{ secrets.CODE_DEPLOY_KEY }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"; exit 0; fi
+          mkdir -p ~/.ssh && echo "$DEPLOY_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          latest=$(git ls-remote --tags --refs "$SOURCE_REPO" 'v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          rm -f ~/.ssh/id_ed25519
+          if [ -z "$latest" ]; then echo "no release tags"; exit 0; fi
+          if gh release view "$latest" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "$latest already built"; exit 0; fi
+          echo "tag=$latest" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.tag != ''
+    concurrency:
+      group: release-${{ needs.detect.outputs.tag }}-${{ matrix.os }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triples: x86_64-pc-windows-msvc
+            args: --bundles msi,nsis
+          # The oldest supported Ubuntu: an AppImage runs on distributions with this glibc or newer.
+          - os: ubuntu-22.04
+            triples: x86_64-unknown-linux-gnu
+            args: --bundles deb,appimage
+          # tauri-build needs the sidecar for both architectures and the universal one.
+          - os: macos-latest
+            triples: aarch64-apple-darwin x86_64-apple-darwin universal-apple-darwin
+            args: --target universal-apple-darwin --bundles app,dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ralabarta/chess-world
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          ref: ${{ env.TAG }}
+          path: app
+      - uses: actions/checkout@v4
+        with:
+          repository: ralabarta/chess-world
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          ref: build-inputs
+          path: inputs
+      - name: Maia-3 weights (sha256-checked)
+        run: |
+          mkdir -p app/src-tauri/resources
+          cp inputs/maia3-5m.onnx app/src-tauri/resources/
+          got=$( (sha256sum app/src-tauri/resources/maia3-5m.onnx 2>/dev/null || shasum -a 256 app/src-tauri/resources/maia3-5m.onnx) | cut -d' ' -f1)
+          if [ "$got" != "$MAIA_SHA256" ]; then echo "::error::maia3-5m.onnx sha256 $got, pinned $MAIA_SHA256"; exit 1; fi
+          rm -rf inputs
+      - name: Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev pkg-config build-essential patchelf file
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          key: release
+      - run: npm ci
+        working-directory: app
+      - name: Stockfish (pinned release, sha256-checked)
+        working-directory: app
+        run: for t in ${{ matrix.triples }}; do npm run fetch:stockfish -- --target "$t" --force; done
+
+      - name: Import the Windows signing certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pw = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+          Remove-Item $pfx
+          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+      # Only secrets that are set reach the build: Tauri treats a set-but-empty variable as "sign with this".
+      - name: Signing secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          names="TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          if [ "$RUNNER_OS" = macOS ]; then names="$names APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID"; fi
+          for n in $names; do
+            v="${!n}"
+            if [ -n "$v" ]; then { echo "$n<<__SECRET_EOF__"; echo "$v"; echo "__SECRET_EOF__"; } >> "$GITHUB_ENV"; fi
+          done
+      - name: Release config (Maia resource, updater bundles, signing)
+        working-directory: app
+        run: |
+          conf='{"bundle":{"resources":{"resources/maia3-5m.onnx":"models/maia3-5m.onnx"}}}'
+          if [ "$HAS_UPDATER_KEY" = true ]; then conf=$(jq -c '.bundle.createUpdaterArtifacts = true' <<<"$conf"); fi
+          if [ -n "${WINDOWS_CERT_THUMBPRINT:-}" ]; then
+            conf=$(jq -c --arg t "$WINDOWS_CERT_THUMBPRINT" '.bundle.windows = {certificateThumbprint: $t, digestAlgorithm: "sha256", timestampUrl: "http://timestamp.digicert.com"}' <<<"$conf")
+          fi
+          if [ "$RUNNER_OS" = macOS ] && [ "$HAS_APPLE_CERT" != true ]; then conf=$(jq -c '.bundle.macOS.signingIdentity = "-"' <<<"$conf"); fi
+          echo "$conf" > release.conf.json
+          cat release.conf.json
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: app
+          tagName: ${{ env.TAG }}
+          releaseName: Chess World __VERSION__
+          releaseBody: "Draft: paste the CHANGELOG section, check the installers (smoke test), then publish."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }} --config release.conf.json

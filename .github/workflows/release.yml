@@ -1,26 +1,24 @@
 # Builds Chess World installers from the private source repo and publishes them here, in this public
-# releases-only repo (the source stays private). Runs for every new `v*` tag of ralabarta/chess-world
-# (hourly check) or by hand for a given tag. The result is a DRAFT release: check the installers
-# (smoke test in the source repo's docs/release.md), then publish it; only published releases reach
-# the in-app updater (https://github.com/ralabarta/chess-world-releases/releases/latest/download/latest.json).
+# releases-only repo (the source stays private). Runs only by hand for a given tag: installers are normally
+# built on the owner's machine, this workflow is the fallback (e.g. macOS). A `vX.Y.Z-beta.N` tag builds the
+# closed beta: installers with the licence gate (`--features beta`), marked as a pre-release (never offered by
+# the in-app updater). The result is a DRAFT release: check the installers (smoke test in the source repo's
+# docs/release.md), then publish it; only published releases reach the in-app updater (https://github.com/ralabarta/chess-world-releases/releases/latest/download/latest.json).
 # Secrets (this repo): CODE_DEPLOY_KEY (read-only deploy key of the source repo), TAURI_SIGNING_PRIVATE_KEY,
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD; optional APPLE_* / WINDOWS_CERTIFICATE* (signing is skipped without them).
 name: Release
 
 on:
-  schedule:
-    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Source tag to build, e.g. v0.3.0"
+        description: "Source tag to build, e.g. v0.9.0 or v0.9.0-beta.1"
         required: true
 
 permissions:
   contents: write
 
 env:
-  SOURCE_REPO: git@github.com:ralabarta/chess-world.git
   MAIA_SHA256: f13b860dbe8d36e2c024a428cbcc719e0e586059f0b898a12976817504c2c726
 
 jobs:
@@ -31,18 +29,10 @@ jobs:
     steps:
       - id: pick
         env:
-          GH_TOKEN: ${{ github.token }}
-          DEPLOY_KEY: ${{ secrets.CODE_DEPLOY_KEY }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ -n "$INPUT_TAG" ]; then echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"; exit 0; fi
-          mkdir -p ~/.ssh && echo "$DEPLOY_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          latest=$(git ls-remote --tags --refs "$SOURCE_REPO" 'v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
-          rm -f ~/.ssh/id_ed25519
-          if [ -z "$latest" ]; then echo "no release tags"; exit 0; fi
-          if gh release view "$latest" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "$latest already built"; exit 0; fi
-          echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          if ! grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$' <<<"$INPUT_TAG"; then echo "::error::bad tag $INPUT_TAG"; exit 1; fi
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: detect
@@ -57,8 +47,9 @@ jobs:
           - os: windows-latest
             triples: x86_64-pc-windows-msvc
             args: --bundles msi,nsis
-          # The oldest supported Ubuntu: an AppImage runs on distributions with this glibc or newer.
-          - os: ubuntu-22.04
+          # The oldest supported Ubuntu: an AppImage runs on distributions with this glibc or newer. 24.04 (glibc
+          # 2.39) because the prebuilt ONNX Runtime linked by `ort` needs glibc 2.38 (22.04 fails to link).
+          - os: ubuntu-24.04
             triples: x86_64-unknown-linux-gnu
             args: --bundles deb,appimage
           # tauri-build needs the sidecar for both architectures and the universal one.
@@ -69,6 +60,8 @@ jobs:
     timeout-minutes: 150
     env:
       TAG: ${{ needs.detect.outputs.tag }}
+      # Closed-beta tags must ship the licence gate: an ungated beta installer would open for anyone.
+      BETA_ARGS: ${{ contains(needs.detect.outputs.tag, '-beta.') && '--features beta' || '' }}
       HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
@@ -118,6 +111,11 @@ jobs:
       - name: Stockfish (pinned release, sha256-checked)
         working-directory: app
         run: for t in ${{ matrix.triples }}; do npm run fetch:stockfish -- --target "$t" --force; done
+      # Prebuilt era book (src-tauri/resources/era-book.cwb.zst): first use unpacks it in ~1 s instead of
+      # building it (17-46 s on min-spec CPUs). Platform-independent data, built with the app's own code.
+      - name: Era book
+        working-directory: app
+        run: bash scripts/build-era-book.sh
 
       - name: Import the Windows signing certificate
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
@@ -170,5 +168,5 @@ jobs:
           releaseName: Chess World __VERSION__
           releaseBody: "Draft: paste the CHANGELOG section, check the installers (smoke test), then publish."
           releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }} --config release.conf.json
+          prerelease: ${{ contains(needs.detect.outputs.tag, '-beta.') }}
+          args: ${{ matrix.args }} --config release.conf.json ${{ env.BETA_ARGS }}

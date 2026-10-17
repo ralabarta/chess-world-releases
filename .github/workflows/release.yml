@@ -9,7 +9,8 @@
 # them to the draft; with the `publish_feeds` input it also uploads them to `channels` (uploading is the release
 # switch: only do it once the draft is published). Maia-3 weights are never fetched or shipped (user-supplied only).
 # Secrets (this repo): CODE_DEPLOY_KEY (read-only deploy key of the source repo); optional TAURI_SIGNING_PRIVATE_KEY +
-# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (updater signing and feeds), APPLE_* / WINDOWS_CERTIFICATE* (skipped without them).
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (updater signing and feeds), APPLE_* / WINDOWS_CERTIFICATE* (skipped without them);
+# CW_BETA_ARCHIVE_KEY (required for beta tags: the derived data-archive key, `licence archive-key`).
 name: Release
 
 on:
@@ -180,6 +181,19 @@ jobs:
           if [ "$RUNNER_OS" = macOS ] && [ "$HAS_APPLE_CERT" != true ]; then conf=$(jq -c '.bundle.macOS.signingIdentity = "-"' <<<"$conf"); fi
           echo "$conf" > release.conf.json
           cat release.conf.json
+      # LIC-HARDEN-b: a beta build packs its data with the beta archive key, which only a valid licence hands back to
+      # the app. CI gets the derived key (never the licence signing seed, which can forge licences).
+      - name: Beta archive key
+        if: contains(needs.detect.outputs.tag, '-beta.')
+        shell: bash
+        env:
+          CW_BETA_ARCHIVE_KEY: ${{ secrets.CW_BETA_ARCHIVE_KEY }}
+        run: |
+          if [ -z "$CW_BETA_ARCHIVE_KEY" ]; then
+            echo "::error::beta tags need the CW_BETA_ARCHIVE_KEY secret in this repo (owner, in the source repo's src-tauri: cargo run -q --features licence-cli --bin licence -- archive-key)"
+            exit 1
+          fi
+          { echo "CW_BETA_ARCHIVE_KEY<<__SECRET_EOF__"; echo "$CW_BETA_ARCHIVE_KEY"; echo "__SECRET_EOF__"; } >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ github.token }}

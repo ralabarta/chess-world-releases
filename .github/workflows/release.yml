@@ -3,9 +3,13 @@
 # built on the owner's machine, this workflow is the fallback (e.g. macOS). A `vX.Y.Z-beta.N` tag builds the
 # closed beta: installers with the licence gate (`--features beta`), marked as a pre-release (never offered by
 # the in-app updater). The result is a DRAFT release: check the installers (smoke test in the source repo's
-# docs/release.md), then publish it; only published releases reach the in-app updater (https://github.com/ralabarta/chess-world-releases/releases/latest/download/latest.json).
-# Secrets (this repo): CODE_DEPLOY_KEY (read-only deploy key of the source repo), TAURI_SIGNING_PRIVATE_KEY,
-# TAURI_SIGNING_PRIVATE_KEY_PASSWORD; optional APPLE_* / WINDOWS_CERTIFICATE* (signing is skipped without them).
+# docs/release.md), then publish it. The in-app updater reads the channel feeds latest-<channel>.json of the fixed
+# `channels` release (source docs/release.md, section 7): with the updater key, the `feeds` job writes them from the
+# signed Linux .AppImage and Windows -setup.exe (beta tags: beta feed only; other tags: stable and beta) and attaches
+# them to the draft; with the `publish_feeds` input it also uploads them to `channels` (uploading is the release
+# switch: only do it once the draft is published). Maia-3 weights are never fetched or shipped (user-supplied only).
+# Secrets (this repo): CODE_DEPLOY_KEY (read-only deploy key of the source repo); optional TAURI_SIGNING_PRIVATE_KEY +
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (updater signing and feeds), APPLE_* / WINDOWS_CERTIFICATE* (skipped without them).
 name: Release
 
 on:
@@ -14,12 +18,16 @@ on:
       tag:
         description: "Source tag to build, e.g. v0.9.0 or v0.9.0-beta.1"
         required: true
+      publish_feeds:
+        description: "Also upload the update feeds to the `channels` release (only once the draft is published)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 env:
-  MAIA_SHA256: f13b860dbe8d36e2c024a428cbcc719e0e586059f0b898a12976817504c2c726
+  KIBITZ_SHA256: 71f470bab415399a3f52659f1643eb93c338d86f8edc03d42431ec1ecef100e5  # Kibitz v0 final
 
 jobs:
   detect:
@@ -81,12 +89,12 @@ jobs:
           ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
           ref: build-inputs
           path: inputs
-      - name: Maia-3 weights (sha256-checked)
+      - name: Kibitz weights (sha256-checked)
         run: |
           mkdir -p app/src-tauri/resources
-          cp inputs/maia3-5m.onnx app/src-tauri/resources/
-          got=$( (sha256sum app/src-tauri/resources/maia3-5m.onnx 2>/dev/null || shasum -a 256 app/src-tauri/resources/maia3-5m.onnx) | cut -d' ' -f1)
-          if [ "$got" != "$MAIA_SHA256" ]; then echo "::error::maia3-5m.onnx sha256 $got, pinned $MAIA_SHA256"; exit 1; fi
+          cp inputs/kibitz.onnx app/src-tauri/resources/
+          got=$( (sha256sum app/src-tauri/resources/kibitz.onnx 2>/dev/null || shasum -a 256 app/src-tauri/resources/kibitz.onnx) | cut -d' ' -f1)
+          if [ "$got" != "$KIBITZ_SHA256" ]; then echo "::error::kibitz.onnx sha256 $got, pinned $KIBITZ_SHA256"; exit 1; fi
           rm -rf inputs
       - name: Tauri Linux dependencies
         if: runner.os == 'Linux'
@@ -116,6 +124,19 @@ jobs:
       - name: Era book
         working-directory: app
         run: bash scripts/build-era-book.sh
+      # Built-in Syzygy 3-4-5 tablebases (~940 MiB, every file sha256-pinned by the script).
+      - name: Syzygy tablebases
+        working-directory: app
+        run: node scripts/fetch-syzygy.mjs --out src-tauri/resources/syzygy
+      - name: Stockfish nets for NetMode (CC0-1.0, sha256-pinned)
+        working-directory: app
+        run: |
+          if ! command -v sha256sum >/dev/null; then  # macOS: the script calls sha256sum -c --status
+            mkdir -p "$RUNNER_TEMP/bin"; printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$RUNNER_TEMP/bin/sha256sum"
+            chmod +x "$RUNNER_TEMP/bin/sha256sum"; export PATH="$RUNNER_TEMP/bin:$PATH"
+          fi
+          SFNET_DIR=src-tauri/resources/nets sh scripts/engine/fetch-sf-nets-extra.sh
+          rm -f src-tauri/resources/nets/*.part
 
       - name: Import the Windows signing certificate
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
@@ -148,10 +169,10 @@ jobs:
             v="${!n}"
             if [ -n "$v" ]; then { echo "$n<<__SECRET_EOF__"; echo "$v"; echo "__SECRET_EOF__"; } >> "$GITHUB_ENV"; fi
           done
-      - name: Release config (Maia resource, updater bundles, signing)
+      - name: Release config (bundled models and tables, updater bundles, signing)
         working-directory: app
         run: |
-          conf='{"bundle":{"resources":{"resources/maia3-5m.onnx":"models/maia3-5m.onnx"}}}'
+          conf='{"bundle":{"resources":{"resources/kibitz.onnx":"models/kibitz.onnx","resources/syzygy/*":"syzygy/","resources/nets/*":"nets/"}}}'
           if [ "$HAS_UPDATER_KEY" = true ]; then conf=$(jq -c '.bundle.createUpdaterArtifacts = true' <<<"$conf"); fi
           if [ -n "${WINDOWS_CERT_THUMBPRINT:-}" ]; then
             conf=$(jq -c --arg t "$WINDOWS_CERT_THUMBPRINT" '.bundle.windows = {certificateThumbprint: $t, digestAlgorithm: "sha256", timestampUrl: "http://timestamp.digicert.com"}' <<<"$conf")
@@ -170,3 +191,44 @@ jobs:
           releaseDraft: true
           prerelease: ${{ contains(needs.detect.outputs.tag, '-beta.') }}
           args: ${{ matrix.args }} --config release.conf.json ${{ env.BETA_ARGS }}
+
+  # Update feeds (source docs/release.md, section 7) from the signed Linux .AppImage and Windows -setup.exe of the draft.
+  feeds:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Updater key present?
+        if: env.HAS_UPDATER_KEY != 'true'
+        run: echo '::notice::No TAURI_SIGNING_PRIVATE_KEY secret - unsigned build, no update feeds written or uploaded.'
+      - uses: actions/checkout@v4
+        if: env.HAS_UPDATER_KEY == 'true'
+        with:
+          repository: ralabarta/chess-world
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          ref: ${{ env.TAG }}
+          path: app
+          sparse-checkout: scripts/updater-feed.sh
+          sparse-checkout-cone-mode: false
+      - name: Write the feeds
+        if: env.HAS_UPDATER_KEY == 'true'
+        run: |
+          version=${TAG#v}
+          channels=stable,beta
+          if [[ $TAG == *-beta.* ]]; then channels=beta; fi  # a beta never reaches the stable feed
+          mkdir feed
+          gh release download "$TAG" --dir feed --pattern '*.AppImage.sig' --pattern '*-setup.exe.sig'
+          for s in feed/*.sig; do touch "${s%.sig}"; done  # the script only needs the bundle names and their .sig
+          bash app/scripts/updater-feed.sh --dir feed --version "$version" --tag "$TAG" --channels "$channels" \
+            --notes "See https://github.com/$GH_REPO/releases/tag/$TAG"
+          gh release upload "$TAG" feed/latest-*.json --clobber
+      - name: Publish the feeds to the channels release
+        if: env.HAS_UPDATER_KEY == 'true' && inputs.publish_feeds
+        run: gh release upload channels feed/latest-*.json --clobber
